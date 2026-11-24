@@ -1,131 +1,83 @@
-#include "Mask.h"
-#include "driver/gpio.h"
-#include "driver/spi_common.h"
-#include "driver/spi_master.h"
-#include "esp_err.h"
-#include "freertos/idf_additions.h"
-#include "freertos/projdefs.h"
-#include "hal/gpio_types.h"
-#include "hal/spi_types.h"
-#include "mirf.h"
-#include "soc/gpio_num.h"
-#include <assert.h>
-#include <esp_log.h>
-#include <esp_system.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
+/* 从 RP2040 接收定长 FramePkt，分片齐全且通过 JPEG 解码后才刷新画面。 */
+#include "display.h"
+#include "frame.h"
+#include "nrf24.h"
 
-#define SPI_SCK 49
-#define SPI_MOSI 50
-#define SPI_MISO 48
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
-#define NRF_IRQ 16
+static const char *const TAG = "P4-Recv";
+static frame_assembly_t frame;
+static uint32_t dropped_frames;
 
-// static const char *RADDR = "CTROL";
-// static const char *TADDR = "CAMRA";
-
-static uint8_t buf[32] = {0};
-
-static uint8_t pic_buf[2 << 14] = {0};
-
-static uint8_t cnt = 0;
-
-static esp_err_t ret = {0};
-
-// frame_id : 10min -> 10fps -> 6000 -> 2^8 * 2 ^ 8 = 16384
-// sub_frame_id : 1 frame = 6000 byte = 2^8 = 512
-// frame_id         = pkt_info & 0000_0000_0000_0000_1111_1111_1111_1111
-// sub_frame_id     = pkt_info & 0000_0000_1111_1111_0000_0000_0000_0000
-// expect_pkt_num   = pkt_info & 1111_1111_0000_0000_0000_0000_0000_0000
-//
-
-struct FramePkt {
-  uint32_t pkt_info;    // 4
-  uint8_t pkt_data[28]; // 28
-};
-
-struct CtrlPkt {
-  uint16_t exp_sub_data; // 2
-  uint8_t pkt_type;      // 1
-};
-
-typedef struct FramePkt FramePkt;
-typedef struct CtrlPkt CtrlPkt;
-
-void nrf_init(NRF24_t *dev, uint8_t NRF_CE_PIN, uint8_t NRF_CSN_PIN,
-              uint8_t SPI_HOST) {
-
-  gpio_reset_pin(NRF_CE_PIN);
-  gpio_set_direction(NRF_CE_PIN, GPIO_MODE_OUTPUT);
-  gpio_set_level(NRF_CE_PIN, 0);
-
-  gpio_reset_pin(NRF_CSN_PIN);
-  gpio_set_direction(NRF_CSN_PIN, GPIO_MODE_OUTPUT);
-  gpio_set_level(NRF_CSN_PIN, 0);
-  spi_device_interface_config_t nrf_spi = {0};
-  nrf_spi.clock_speed_hz = 4 * 1000 * 1000;
-  nrf_spi.mode = 0;
-  nrf_spi.spics_io_num = -1;
-  nrf_spi.queue_size = 7;
-  nrf_spi.flags = SPI_DEVICE_NO_DUMMY;
-
-  spi_device_handle_t handle = {0};
-
-  ret = spi_bus_add_device(SPI_HOST, &nrf_spi, &handle);
-  assert(ret == ESP_OK);
-
-  dev->_SPIHandle = handle;
-  dev->cePin = NRF_CE_PIN;
-  dev->csnPin = NRF_CSN_PIN;
-  Nrf24_printDetails(dev);
+static void drop_frame(const char *reason)
+{
+    frame.active = false;
+    ESP_LOGW(TAG, "帧 %u 丢弃 (%u/%u 包，累计 %u)：%s",
+             frame.id, frame.received, frame.total, (unsigned)++dropped_frames, reason);
 }
 
-static FramePkt pkt_buf = {0};
-
-void print_data(FramePkt *buf) {
-  printf("data:");
-  for (uint8_t i = 0; i < 28; i++) {
-    printf("%zu ", buf->pkt_data[i]);
-  }
-  putc('\n', stdout);
-}
-
-void app_main(void) {
-
-  spi_bus_config_t bus_config = {
-      .miso_io_num = SPI_MISO,
-      .mosi_io_num = SPI_MOSI,
-      .sclk_io_num = SPI_SCK,
-      .quadhd_io_num = -1,
-      .quadwp_io_num = -1,
-  };
-
-  ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus_config, SPI_DMA_CH_AUTO));
-
-  NRF24_t recv = {0};
-  nrf_init(&recv, GPIO_NUM_23, 51, SPI2_HOST);
-  Nrf24_config(&recv, 90, 32);
-  Nrf24_setRADDR(&recv, (uint8_t *)"CTROL");
-  Nrf24_setTADDR(&recv, (uint8_t *)"CAMRA");
-
-  Nrf24_powerUpRx(&recv);
-  gpio_set_level(GPIO_NUM_4, 1);
-
-  while (1) {
-    while (!Nrf24_rxFifoEmpty(&recv)) {
-      Nrf24_getData(&recv, (uint8_t *)&pkt_buf);
-      // printf("EXP_PKT_NUM : %#lx , SUB_FRAME_ID : %#lx , FRAME_ID : %#lx \n",
-      //        (pkt_buf.pkt_info & EXPECT_PKT_NUM),
-      //        (pkt_buf.pkt_info & SUB_FRAME_MASK) << 8,
-      //        (pkt_buf.pkt_info & FRAME_ID_MASK) << 16);
-      // print_data(b);
-      // printf("pkt_id : %d \n", (int)b->pkt_data[]);
-      printf("INFO : %#lx \n", pkt_buf.pkt_info);
-      memcpy(&pic_buf[(uint8_t)((pkt_buf.pkt_info & SUB_FRAME_MASK) >> 16)],
-             pkt_buf.pkt_data, 28);
-      memset(&pkt_buf, 0, sizeof(pkt_buf));
+static void accept_packet(const uint8_t packet[NRF_PAYLOAD_SIZE], uint64_t now)
+{
+    frame_header_t header;
+    if (!frame_read_header(packet, &header)) {
+        ESP_LOGW(TAG, "分片编号无效：帧 %u，分片 %u/%u", header.id, header.index, header.total);
+        return;
     }
-    vTaskDelay(pdMS_TO_TICKS(10));
-  }
+    if (frame.known_id && frame.id == header.id) {
+        if (!frame.active) {
+            return;
+        }
+        if (frame.total != header.total) {
+            drop_frame("总包数不一致");
+            return;
+        }
+    } else {
+        if (frame.active) {
+            drop_frame("下一帧已到，当前帧分片不全");
+        }
+        frame_start(&frame, header);
+    }
+    if (!frame_add(&frame, header, packet + FRAME_HEADER_SIZE, now)) {
+        return;
+    }
+
+    const size_t len = frame_jpeg_size(&frame);
+    if (!len) {
+        drop_frame("JPEG 首尾标记或尾包填充无效");
+        return;
+    }
+    const esp_err_t err = display_jpeg(frame.jpeg, len);
+    if (err != ESP_OK) {
+        drop_frame(esp_err_to_name(err));
+        return;
+    }
+    frame.active = false;
+    ESP_LOGI(TAG, "帧 %u %u 包，JPEG %u B，累计丢帧 %u，%s",
+             frame.id, frame.received, (unsigned)len, (unsigned)dropped_frames,
+             display_has_panel() ? "已写入屏幕缓冲" : "已解码");
+}
+
+void app_main(void)
+{
+    ESP_ERROR_CHECK(display_init());
+    ESP_ERROR_CHECK(nrf24_init());
+    ESP_LOGI(TAG, "nRF24 就绪，信道 %u，等待 RP2040 发帧", NRF_RF_CHANNEL);
+
+    uint8_t packet[NRF_PAYLOAD_SIZE];
+    while (true) {
+        bool received;
+        const esp_err_t err = nrf24_receive(packet, &received);
+        const uint64_t now = esp_timer_get_time();
+        if (frame.active && now - frame.last_fragment_us >= FRAME_TIMEOUT_US) {
+            drop_frame("等待分片超时");
+        }
+        if (err == ESP_OK && received) {
+            accept_packet(packet, now);
+        } else {
+            vTaskDelay(1);
+        }
+    }
 }
