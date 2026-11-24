@@ -1,6 +1,8 @@
 # P4-Recv
 
-接收 [RP2040-Data-Trans](https://github.com/lizipear2403/RP2040-Data-Trans) 经单路 nRF24L01+ 发送的 JPEG。收到一帧的全部分片后，交由 ESP32-P4 硬件解码为 320×240 RGB565。接收端面板为 640×480 MIPI DSI，驱动 IC 为 NV3051。启用面板后，画面按原尺寸在屏上居中显示，左上角为 (160, 120)。
+接收 [RP2040-Data-Trans](https://github.com/lizipear2403/RP2040-Data-Trans) 经单路 nRF24L01+ 发送的 JPEG。收到一帧的全部分片后，交由 ESP32-P4 硬件解码为 320×240 RGB565。接收端面板为 640×480，驱动 IC 为 NV3051，采用 30 针排线连接 MIPI DSI。启用面板后，画面按原尺寸在屏上居中显示，左上角为 (160, 120)。
+
+排线的针序、针距、触点朝向以及 DSI 数据 lane 数以实际面板规格书和板卡原理图为准。
 
 ```sh
 # 进入已导出 ESP-IDF v6.1.1 的环境
